@@ -5,7 +5,7 @@ use miden::protocol::note
 use miden::protocol::tx
 use miden::standards::data_structures::double_word_array
 use miden::standards::attachments::network_account_target
-use miden::standards::note_tag::DEFAULT_TAG
+use miden::standards::note_tag
 use miden::protocol::output_note
 use miden::core::crypto::hashes::keccak256
 use miden::core::crypto::hashes::rpo256
@@ -475,7 +475,8 @@ proc create_burn_note
     # => [RECIPIENT]
 
     push.PUBLIC_NOTE
-    push.DEFAULT_TAG
+    loc_load.CREATE_BURN_NOTE_BURN_ASSET_LOC
+    exec.note_tag::create_account_target
     # => [tag, note_type, RECIPIENT]
 
     call.output_note::create
