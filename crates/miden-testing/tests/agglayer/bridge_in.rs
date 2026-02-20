@@ -102,10 +102,15 @@ fn merkle_proof_verification_code(
 async fn test_bridge_in_claim_to_p2id() -> anyhow::Result<()> {
     let mut builder = MockChain::builder();
 
+    // CREATE ADMIN ACCOUNT
+    // --------------------------------------------------------------------------------------------
+    let admin_account = builder.add_existing_wallet(Auth::BasicAuth)?;
+
     // CREATE BRIDGE ACCOUNT (with bridge_out component for MMR validation)
     // --------------------------------------------------------------------------------------------
     let bridge_seed = builder.rng_mut().draw_word();
-    let bridge_account = create_existing_bridge_account(bridge_seed);
+    let bridge_account =
+        create_existing_bridge_account(bridge_seed, admin_account.id(), admin_account.id());
     builder.add_account(bridge_account.clone())?;
 
     // CREATE AGGLAYER FAUCET ACCOUNT (with agglayer_faucet component)
@@ -184,7 +189,7 @@ async fn test_bridge_in_claim_to_p2id() -> anyhow::Result<()> {
     // CREATE UPDATE_GER NOTE WITH GLOBAL EXIT ROOT
     // --------------------------------------------------------------------------------------------
     let update_ger_note =
-        UpdateGerNote::create(ger, sender_account.id(), bridge_account.id(), builder.rng_mut())?;
+        UpdateGerNote::create(ger, admin_account.id(), bridge_account.id(), builder.rng_mut())?;
     builder.add_output_note(OutputNote::Full(update_ger_note.clone()));
 
     // BUILD MOCK CHAIN WITH ALL ACCOUNTS
