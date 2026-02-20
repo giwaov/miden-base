@@ -15,6 +15,11 @@ impl TokenSymbol {
     /// The length of the set of characters that can be used in a token's name.
     pub const ALPHABET_LENGTH: u64 = 26;
 
+    /// The minimum integer value of an encoded [`TokenSymbol`].
+    ///
+    /// This value encodes the "A" token symbol.
+    pub const MIN_ENCODED_VALUE: u64 = 1;
+
     /// The maximum integer value of an encoded [`TokenSymbol`].
     ///
     /// This value encodes the "ZZZZZZZZZZZZ" token symbol.
@@ -86,9 +91,14 @@ impl TryFrom<Felt> for TokenSymbol {
     type Error = TokenSymbolError;
 
     fn try_from(felt: Felt) -> Result<Self, Self::Error> {
+        let value = felt.as_int();
+
         // Check if the felt value is within the valid range
-        if felt.as_int() > Self::MAX_ENCODED_VALUE {
-            return Err(TokenSymbolError::ValueTooLarge(felt.as_int()));
+        if value < Self::MIN_ENCODED_VALUE {
+            return Err(TokenSymbolError::ValueTooSmall(value));
+        }
+        if value > Self::MAX_ENCODED_VALUE {
+            return Err(TokenSymbolError::ValueTooLarge(value));
         }
         Ok(TokenSymbol(felt))
     }
@@ -276,6 +286,21 @@ mod test {
     fn test_token_symbol_max_value() {
         let token_symbol = TokenSymbol::try_from("ZZZZZZZZZZZZ").unwrap();
         assert_eq!(Felt::from(token_symbol).as_int(), TokenSymbol::MAX_ENCODED_VALUE);
+    }
+
+    /// Utility test to make sure that the [TokenSymbol::MIN_ENCODED_VALUE] constant still
+    /// represents the minimum possible encoded value.
+    #[test]
+    fn test_token_symbol_min_value() {
+        let token_symbol = TokenSymbol::try_from("A").unwrap();
+        assert_eq!(Felt::from(token_symbol).as_int(), TokenSymbol::MIN_ENCODED_VALUE);
+    }
+
+    /// Tests that [TokenSymbol::try_from(Felt)] rejects values below the minimum encoded value.
+    #[test]
+    fn test_token_symbol_underflow() {
+        let result = TokenSymbol::try_from(Felt::ZERO);
+        assert_matches!(result.unwrap_err(), TokenSymbolError::ValueTooSmall(0));
     }
 
     // Const function tests
