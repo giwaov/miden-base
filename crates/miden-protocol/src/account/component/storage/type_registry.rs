@@ -451,12 +451,7 @@ impl FeltType for TokenSymbol {
                 value.as_int()
             ))
         })?;
-        token.to_string().map_err(|err| {
-            SchemaTypeError::ConversionError(format!(
-                "failed to display token_symbol value `{}`: {err}",
-                value.as_int()
-            ))
-        })
+        Ok(token.to_string())
     }
 }
 

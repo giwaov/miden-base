@@ -1,11 +1,16 @@
 use alloc::string::String;
+use core::fmt;
 
 use super::{Felt, TokenSymbolError};
 
 /// Represents a string token symbol (e.g. "POL", "ETH") as a single [`Felt`] value.
 ///
 /// Token Symbols can consists of up to 12 capital Latin characters, e.g. "C", "ETH", "MIDEN".
-#[derive(Default, Clone, Copy, Debug, PartialEq)]
+///
+/// A `TokenSymbol` can only be constructed through validated paths ([`TokenSymbol::new`],
+/// [`TokenSymbol::from_static_str`], or [`TryFrom<Felt>`]), ensuring the inner value always
+/// represents a valid symbol. This makes [`Display`] infallible.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TokenSymbol(Felt);
 
 impl TokenSymbol {
@@ -19,6 +24,11 @@ impl TokenSymbol {
     ///
     /// This value encodes the "ZZZZZZZZZZZZ" token symbol.
     pub const MAX_ENCODED_VALUE: u64 = 2481152873203736562;
+
+    /// The minimum integer value of an encoded [`TokenSymbol`].
+    ///
+    /// This value encodes the "A" token symbol.
+    pub const MIN_ENCODED_VALUE: u64 = 1;
 
     /// Constructs a new [`TokenSymbol`] from a static string.
     ///
@@ -56,15 +66,15 @@ impl TokenSymbol {
         Ok(Self(felt))
     }
 
-    /// Returns the token name string from the encoded [`TokenSymbol`] value.
-    ///     
-    /// # Errors
-    /// Returns an error if:
-    /// - The encoded value exceeds the maximum value of [`Self::MAX_ENCODED_VALUE`].
-    /// - The encoded token string length is less than 1 or greater than 12.
-    /// - The encoded token string length is less than the actual string length.
-    pub fn to_string(&self) -> Result<String, TokenSymbolError> {
-        decode_felt_to_symbol(self.0)
+}
+
+impl fmt::Display for TokenSymbol {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // TokenSymbol can only be constructed with valid encoded values, so decoding
+        // always succeeds.
+        let symbol = decode_felt_to_symbol(self.0)
+            .expect("TokenSymbol should always contain a valid encoded value");
+        f.write_str(&symbol)
     }
 }
 
@@ -86,10 +96,9 @@ impl TryFrom<Felt> for TokenSymbol {
     type Error = TokenSymbolError;
 
     fn try_from(felt: Felt) -> Result<Self, Self::Error> {
-        // Check if the felt value is within the valid range
-        if felt.as_int() > Self::MAX_ENCODED_VALUE {
-            return Err(TokenSymbolError::ValueTooLarge(felt.as_int()));
-        }
+        // Fully validate by attempting to decode the felt value. This catches both
+        // out-of-range values and structurally invalid encodings (e.g. Felt::ZERO).
+        decode_felt_to_symbol(felt)?;
         Ok(TokenSymbol(felt))
     }
 }
@@ -205,6 +214,8 @@ fn decode_felt_to_symbol(encoded_felt: Felt) -> Result<String, TokenSymbolError>
 mod test {
     use assert_matches::assert_matches;
 
+    use alloc::string::ToString;
+
     use super::{
         Felt,
         TokenSymbol,
@@ -212,6 +223,7 @@ mod test {
         decode_felt_to_symbol,
         encode_symbol_to_felt,
     };
+    use miden_crypto::FieldElement as _;
 
     #[test]
     fn test_token_symbol_decoding_encoding() {
@@ -230,7 +242,7 @@ mod test {
         ];
         for symbol in symbols {
             let token_symbol = TokenSymbol::try_from(symbol).unwrap();
-            let decoded_symbol = TokenSymbol::to_string(&token_symbol).unwrap();
+            let decoded_symbol = token_symbol.to_string();
             assert_eq!(symbol, decoded_symbol);
         }
 
@@ -276,6 +288,52 @@ mod test {
     fn test_token_symbol_max_value() {
         let token_symbol = TokenSymbol::try_from("ZZZZZZZZZZZZ").unwrap();
         assert_eq!(Felt::from(token_symbol).as_int(), TokenSymbol::MAX_ENCODED_VALUE);
+    }
+
+
+    /// Verifies that `TryFrom<Felt>` rejects `Felt::ZERO`, which has no valid symbol
+    /// representation (the encoded length field would be 0).
+    #[test]
+    fn test_try_from_felt_zero_is_rejected() {
+        let result = TokenSymbol::try_from(Felt::ZERO);
+        assert!(result.is_err());
+        assert_matches!(result.unwrap_err(), TokenSymbolError::InvalidLength(0));
+    }
+
+    /// Verifies that `TryFrom<Felt>` rejects structurally invalid encodings, not just
+    /// out-of-range values.
+    #[test]
+    fn test_try_from_felt_rejects_invalid_encodings() {
+        // Values with length field = 0 (multiples of 26) are invalid
+        let result = TokenSymbol::try_from(Felt::new(26));
+        assert!(result.is_err());
+
+        let result = TokenSymbol::try_from(Felt::new(52));
+        assert!(result.is_err());
+
+        // Values that exceed MAX_ENCODED_VALUE should be rejected
+        let result = TokenSymbol::try_from(Felt::new(TokenSymbol::MAX_ENCODED_VALUE + 1));
+        assert!(result.is_err());
+        assert_matches!(result.unwrap_err(), TokenSymbolError::ValueTooLarge(_));
+
+        // Values where the length doesn't match the actual encoded characters.
+        // Felt(677) has length field = 1 but encodes more data than one character.
+        let result = TokenSymbol::try_from(Felt::new(677));
+        assert!(result.is_err());
+        assert_matches!(result.unwrap_err(), TokenSymbolError::DataNotFullyDecoded);
+    }
+
+    /// Verifies that `TryFrom<Felt>` accepts all valid round-tripped values.
+    #[test]
+    fn test_try_from_felt_accepts_valid_encodings() {
+        let symbols = ["A", "B", "Z", "ETH", "POL", "MIDEN", "ZZZZZZZZZZZZ"];
+        for symbol in symbols {
+            let original = TokenSymbol::new(symbol).unwrap();
+            let felt = Felt::from(original);
+            let roundtripped = TokenSymbol::try_from(felt).unwrap();
+            assert_eq!(original, roundtripped);
+            assert_eq!(symbol, roundtripped.to_string());
+        }
     }
 
     // Const function tests
