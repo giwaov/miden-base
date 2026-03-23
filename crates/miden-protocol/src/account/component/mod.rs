@@ -2,6 +2,7 @@ use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
 
 use miden_mast_package::{MastArtifact, Package};
+use miden_processor::mast::MastNodeExt;
 
 mod metadata;
 pub use metadata::*;
@@ -12,10 +13,13 @@ pub use storage::*;
 mod code;
 pub use code::AccountComponentCode;
 
-use crate::account::{AccountType, StorageSlot};
+use crate::account::{AccountProcedureRoot, AccountType, StorageSlot};
 use crate::assembly::Path;
 use crate::errors::AccountError;
 use crate::{MastForest, Word};
+
+/// The attribute name used to mark the authentication procedure in an account component.
+const AUTH_SCRIPT_ATTRIBUTE: &str = "auth_script";
 
 // ACCOUNT COMPONENT
 // ================================================================================================
@@ -192,16 +196,24 @@ impl AccountComponent {
         self.metadata.supported_types().contains(&account_type)
     }
 
-    /// Returns a vector of tuples (digest, is_auth) for all procedures in this component.
-    pub fn get_procedures(&self) -> Vec<(Word, bool)> {
-        let mut procedures = Vec::new();
-        for module in self.code.as_library().module_infos() {
-            for (_, procedure_info) in module.procedures() {
-                let is_auth = procedure_info.name.starts_with("auth_");
-                procedures.push((procedure_info.digest, is_auth));
-            }
-        }
-        procedures
+    /// Returns an iterator over ([`AccountProcedureRoot`], is_auth) for all procedures in this
+    /// component.
+    ///
+    /// A procedure is considered an authentication procedure if it has the `@auth_script`
+    /// attribute.
+    pub fn procedures(&self) -> impl Iterator<Item = (AccountProcedureRoot, bool)> + '_ {
+        let library = self.code.as_library();
+        library.exports().filter_map(|export| {
+            export.as_procedure().map(|proc_export| {
+                let digest = library
+                    .mast_forest()
+                    .get_node_by_id(proc_export.node)
+                    .expect("export node not in the forest")
+                    .digest();
+                let is_auth = proc_export.attributes.has(AUTH_SCRIPT_ATTRIBUTE);
+                (AccountProcedureRoot::from_raw(digest), is_auth)
+            })
+        })
     }
 
     /// Returns the digest of the procedure with the specified path, or `None` if it was not found
@@ -223,7 +235,6 @@ mod tests {
     use alloc::sync::Arc;
 
     use miden_assembly::Assembler;
-    use miden_core::utils::Serializable;
     use miden_mast_package::{
         MastArtifact,
         Package,
@@ -236,6 +247,7 @@ mod tests {
 
     use super::*;
     use crate::testing::account_code::CODE;
+    use crate::utils::serde::Serializable;
 
     #[test]
     fn test_extract_metadata_from_package() {
@@ -243,10 +255,12 @@ mod tests {
         let library = Assembler::default().assemble_library([CODE]).unwrap();
 
         // Test with metadata
-        let metadata = AccountComponentMetadata::new("test_component")
-            .with_description("A test component")
-            .with_version(Version::new(1, 0, 0))
-            .with_supported_type(AccountType::RegularAccountImmutableCode);
+        let metadata = AccountComponentMetadata::new(
+            "test_component",
+            [AccountType::RegularAccountImmutableCode],
+        )
+        .with_description("A test component")
+        .with_version(Version::new(1, 0, 0));
 
         let metadata_bytes = metadata.to_bytes();
         let package_with_metadata = Package {
@@ -295,10 +309,9 @@ mod tests {
         let component_code = AccountComponentCode::from(library.clone());
 
         // Create metadata for the component
-        let metadata = AccountComponentMetadata::new("test_component")
+        let metadata = AccountComponentMetadata::new("test_component", AccountType::regular())
             .with_description("A test component")
-            .with_version(Version::new(1, 0, 0))
-            .with_supports_regular_types();
+            .with_version(Version::new(1, 0, 0));
 
         // Test with empty init data - this tests the complete workflow:
         // Library + Metadata -> AccountComponent

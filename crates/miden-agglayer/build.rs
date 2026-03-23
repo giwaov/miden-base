@@ -1,12 +1,21 @@
 use std::env;
+use std::fmt::Write;
 use std::path::Path;
 
 use fs_err as fs;
-use miden_assembly::diagnostics::{IntoDiagnostic, Result, WrapErr};
-use miden_assembly::utils::Serializable;
+use miden_assembly::diagnostics::{IntoDiagnostic, NamedSource, Result, WrapErr};
+use miden_assembly::serde::Serializable;
 use miden_assembly::{Assembler, Library, Report};
 use miden_crypto::hash::keccak::{Keccak256, Keccak256Digest};
+use miden_protocol::account::{
+    AccountCode,
+    AccountComponent,
+    AccountComponentMetadata,
+    AccountType,
+};
 use miden_protocol::transaction::TransactionKernel;
+use miden_standards::account::auth::NoAuth;
+use miden_standards::account::mint_policies::OwnerControlled;
 
 // CONSTANTS
 // ================================================================================================
@@ -19,17 +28,21 @@ const BUILD_GENERATED_FILES_IN_SRC: bool = option_env!("BUILD_GENERATED_FILES_IN
 const ASSETS_DIR: &str = "assets";
 const ASM_DIR: &str = "asm";
 const ASM_NOTE_SCRIPTS_DIR: &str = "note_scripts";
-const ASM_BRIDGE_DIR: &str = "bridge";
+const ASM_AGGLAYER_DIR: &str = "agglayer";
+const ASM_AGGLAYER_BRIDGE_DIR: &str = "agglayer/bridge";
+const ASM_COMPONENTS_DIR: &str = "components";
 
 const AGGLAYER_ERRORS_FILE: &str = "src/errors/agglayer.rs";
 const AGGLAYER_ERRORS_ARRAY_NAME: &str = "AGGLAYER_ERRORS";
+const AGGLAYER_GLOBAL_CONSTANTS_FILE_NAME: &str = "agglayer_constants.rs";
 
 // PRE-PROCESSING
 // ================================================================================================
 
 /// Read and parse the contents from `./asm`.
+/// - Compiles the contents of asm/agglayer directory into a single agglayer.masl library.
+/// - Compiles the contents of asm/components directory into individual per-component .masl files.
 /// - Compiles the contents of asm/note_scripts directory into individual .masb files.
-/// - Compiles the contents of asm/account_components directory into individual .masl files.
 fn main() -> Result<()> {
     // re-build when the MASM code changes
     println!("cargo::rerun-if-changed={ASM_DIR}/");
@@ -40,8 +53,8 @@ fn main() -> Result<()> {
     let build_dir = env::var("OUT_DIR").unwrap();
     let src = Path::new(&crate_dir).join(ASM_DIR);
 
-    // generate canonical zeros in `asm/bridge/canonical_zeros.masm`
-    generate_canonical_zeros(&src.join(ASM_BRIDGE_DIR))?;
+    // generate canonical zeros in `asm/agglayer/bridge/canonical_zeros.masm`
+    generate_canonical_zeros(&src.join(ASM_AGGLAYER_BRIDGE_DIR))?;
 
     let dst = Path::new(&build_dir).to_path_buf();
     shared::copy_directory(src, &dst, ASM_DIR)?;
@@ -59,12 +72,23 @@ fn main() -> Result<()> {
     let mut assembler = TransactionKernel::assembler();
     assembler.link_static_library(agglayer_lib)?;
 
+    // compile account components (thin wrappers per component) and return their libraries
+    let component_libraries = compile_account_components(
+        &source_dir.join(ASM_COMPONENTS_DIR),
+        &target_dir.join(ASM_COMPONENTS_DIR),
+        assembler.clone(),
+    )?;
+
     // compile note scripts
     compile_note_scripts(
         &source_dir.join(ASM_NOTE_SCRIPTS_DIR),
         &target_dir.join(ASM_NOTE_SCRIPTS_DIR),
         assembler.clone(),
     )?;
+
+    // generate agglayer specific constants
+    let constants_out_path = Path::new(&build_dir).join(AGGLAYER_GLOBAL_CONSTANTS_FILE_NAME);
+    generate_agglayer_constants(constants_out_path, component_libraries)?;
 
     generate_error_constants(&source_dir)?;
 
@@ -74,7 +98,7 @@ fn main() -> Result<()> {
 // COMPILE AGGLAYER LIB
 // ================================================================================================
 
-/// Reads the MASM files from "{source_dir}/bridge" directory, compiles them into a Miden
+/// Reads the MASM files from "{source_dir}/agglayer" directory, compiles them into a Miden
 /// assembly library, saves the library into "{target_dir}/agglayer.masl", and returns the compiled
 /// library.
 fn compile_agglayer_lib(
@@ -82,13 +106,13 @@ fn compile_agglayer_lib(
     target_dir: &Path,
     mut assembler: Assembler,
 ) -> Result<Library> {
-    let source_dir = source_dir.join(ASM_BRIDGE_DIR);
+    let source_dir = source_dir.join(ASM_AGGLAYER_DIR);
 
     // Add the miden-standards library to the assembler so agglayer components can use it
     let standards_lib = miden_standards::StandardsLib::default();
     assembler.link_static_library(standards_lib)?;
 
-    let agglayer_lib = assembler.assemble_library_from_dir(source_dir, "miden::agglayer")?;
+    let agglayer_lib = assembler.assemble_library_from_dir(source_dir, "agglayer")?;
 
     let output_file = target_dir.join("agglayer").with_extension(Library::LIBRARY_EXTENSION);
     agglayer_lib.write_to_file(output_file).into_diagnostic()?;
@@ -136,38 +160,31 @@ fn compile_note_scripts(
     Ok(())
 }
 
-// COMPILE ACCOUNT COMPONENTS (DEPRECATED)
+// COMPILE ACCOUNT COMPONENTS
 // ================================================================================================
 
-/// Compiles the agglayer library in `source_dir` into MASL libraries and stores the compiled
-/// files in `target_dir`.
+/// Compiles the account components in `source_dir` into MASL libraries, stores the compiled
+/// files in `target_dir`, and returns a vector of compiled component libraries along with their
+/// names.
 ///
-/// NOTE: This function is deprecated and replaced by compile_agglayer_lib
-fn _compile_bridge_components(
+/// Each `.masm` file in the components directory is a thin wrapper that re-exports specific
+/// procedures from the main agglayer library. This ensures each component (bridge, faucet)
+/// only exposes the procedures relevant to its role.
+///
+/// The assembler must already have the agglayer library linked so that `pub use` re-exports
+/// can resolve.
+fn compile_account_components(
     source_dir: &Path,
     target_dir: &Path,
-    mut assembler: Assembler,
-) -> Result<Library> {
+    assembler: Assembler,
+) -> Result<Vec<(String, Library)>> {
     if !target_dir.exists() {
         fs::create_dir_all(target_dir).unwrap();
     }
 
-    // Add the miden-standards library to the assembler so agglayer components can use it
-    let standards_lib = miden_standards::StandardsLib::default();
-    assembler.link_static_library(standards_lib)?;
+    let mut component_libraries = Vec::new();
 
-    // Compile all components together as a single library under the "miden::agglayer" namespace
-    // This allows cross-references between components (e.g., bridge_out using
-    // miden::agglayer::local_exit_tree)
-    let agglayer_library = assembler.assemble_library_from_dir(source_dir, "miden::agglayer")?;
-
-    // Write the combined library
-    let library_path = target_dir.join("agglayer").with_extension(Library::LIBRARY_EXTENSION);
-    agglayer_library.write_to_file(library_path).into_diagnostic()?;
-
-    // Also write individual component files for reference
-    let masm_files = shared::get_masm_files(source_dir).unwrap();
-    for masm_file_path in &masm_files {
+    for masm_file_path in shared::get_masm_files(source_dir).unwrap() {
         let component_name = masm_file_path
             .file_stem()
             .expect("masm file should have a file stem")
@@ -175,14 +192,107 @@ fn _compile_bridge_components(
             .expect("file stem should be valid UTF-8")
             .to_owned();
 
-        let component_source_code = fs::read_to_string(masm_file_path)
+        let component_source_code = fs::read_to_string(&masm_file_path)
             .expect("reading the component's MASM source code should succeed");
 
-        let individual_file_path = target_dir.join(&component_name).with_extension("masm");
-        fs::write(individual_file_path, component_source_code).into_diagnostic()?;
+        let named_source = NamedSource::new(component_name.clone(), component_source_code);
+
+        let component_library = assembler
+            .clone()
+            .assemble_library([named_source])
+            .expect("library assembly should succeed");
+
+        let component_file_path =
+            target_dir.join(&component_name).with_extension(Library::LIBRARY_EXTENSION);
+        component_library.write_to_file(&component_file_path).into_diagnostic()?;
+
+        component_libraries.push((component_name, component_library));
     }
 
-    Ok(agglayer_library)
+    Ok(component_libraries)
+}
+
+// GENERATE AGGLAYER CONSTANTS
+// ================================================================================================
+
+/// Generates a Rust file containing AggLayer specific constants.
+///
+/// At the moment, this file contains the following constants:
+/// - AggLayer Bridge code commitment.
+/// - AggLayer Faucet code commitment.
+fn generate_agglayer_constants(
+    target_file: impl AsRef<Path>,
+    component_libraries: Vec<(String, Library)>,
+) -> Result<()> {
+    let mut file_contents = String::new();
+
+    writeln!(
+        file_contents,
+        "// This file is generated by build.rs, do not modify manually.\n"
+    )
+    .unwrap();
+
+    writeln!(
+        file_contents,
+        "// AGGLAYER CONSTANTS
+// ================================================================================================
+"
+    )
+    .unwrap();
+
+    // Create a dummy metadata to be able to create components. We only interested in the resulting
+    // code commitment, so it doesn't matter what does this metadata holds.
+    let dummy_metadata = AccountComponentMetadata::new("dummy", AccountType::all());
+
+    // iterate over the AggLayer Bridge and AggLayer Faucet libraries
+    for (lib_name, content_library) in component_libraries {
+        let agglayer_component =
+            AccountComponent::new(content_library, vec![], dummy_metadata.clone()).unwrap();
+
+        // The faucet account includes Ownable2Step and OwnerControlled components
+        // alongside the agglayer faucet component, since network_fungible::mint_and_send
+        // requires these for access control.
+        let mut components: Vec<AccountComponent> =
+            vec![AccountComponent::from(NoAuth), agglayer_component];
+        if lib_name == "faucet" {
+            // Use a dummy owner for commitment computation - the actual owner is set at runtime
+            let dummy_owner = miden_protocol::account::AccountId::try_from(
+                miden_protocol::testing::account_id::ACCOUNT_ID_REGULAR_NETWORK_ACCOUNT_IMMUTABLE_CODE,
+            )
+            .unwrap();
+            components.push(AccountComponent::from(
+                miden_standards::account::access::Ownable2Step::new(dummy_owner),
+            ));
+            components.push(AccountComponent::from(OwnerControlled::owner_only()));
+        }
+
+        // use `AccountCode` to merge codes of agglayer and authentication components
+        let account_code = AccountCode::from_components(&components, AccountType::FungibleFaucet)
+            .expect("account code creation failed");
+
+        let code_commitment = account_code.commitment();
+
+        writeln!(
+            file_contents,
+            "pub const {}_CODE_COMMITMENT: Word = Word::new([
+    Felt::new({}),
+    Felt::new({}),
+    Felt::new({}),
+    Felt::new({}),
+]);",
+            lib_name.to_uppercase(),
+            code_commitment[0],
+            code_commitment[1],
+            code_commitment[2],
+            code_commitment[3],
+        )
+        .unwrap();
+    }
+
+    // write the resulting constants to the target directory
+    shared::write_if_changed(target_file, file_contents.as_bytes())?;
+
+    Ok(())
 }
 
 // ERROR CONSTANTS FILE GENERATION
@@ -273,7 +383,6 @@ fn generate_canonical_zeros(target_dir: &Path) -> Result<()> {
         let zero_as_u32_vec = zero
             .chunks(4)
             .map(|chunk_u32| u32::from_le_bytes(chunk_u32.try_into().unwrap()).to_string())
-            .rev()
             .collect::<Vec<String>>();
 
         zero_constants.push_str(&format!(
@@ -287,7 +396,7 @@ fn generate_canonical_zeros(target_dir: &Path) -> Result<()> {
     // remove once CANONICAL_ZEROS advice map is available
     zero_constants.push_str(
         "
-use ::miden::agglayer::mmr_frontier32_keccak::mem_store_double_word
+use ::agglayer::common::utils::mem_store_double_word
     
 #! Inputs:  [zeros_ptr]
 #! Outputs: []
@@ -295,7 +404,7 @@ pub proc load_zeros_to_memory\n",
     );
 
     for zero_index in 0..32 {
-        zero_constants.push_str(&format!("\tpush.ZERO_{zero_index}_L.ZERO_{zero_index}_R exec.mem_store_double_word dropw dropw add.8\n"));
+        zero_constants.push_str(&format!("\tpush.ZERO_{zero_index}_R.ZERO_{zero_index}_L exec.mem_store_double_word dropw dropw add.8\n"));
     }
 
     zero_constants.push_str("\tdrop\nend\n");

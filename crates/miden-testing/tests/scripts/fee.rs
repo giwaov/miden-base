@@ -30,7 +30,7 @@ async fn prove_account_creation_with_fees() -> anyhow::Result<()> {
         .context("failed to execute account-creating transaction")?;
 
     let expected_fee = tx.compute_fee();
-    assert_eq!(expected_fee, tx.fee().amount());
+    assert_eq!(expected_fee, tx.fee().amount().inner());
 
     // We expect that the new account contains the amount minus the paid fee.
     let added_asset = FungibleAsset::new(chain.native_asset_id(), amount)?.sub(tx.fee())?;
@@ -45,7 +45,7 @@ async fn prove_account_creation_with_fees() -> anyhow::Result<()> {
     // account commitment should not be the empty word
     assert_ne!(tx.account_delta().to_commitment(), Word::empty());
 
-    prove_and_verify_transaction(tx)?;
+    prove_and_verify_transaction(tx).await?;
 
     Ok(())
 }
